@@ -1,0 +1,14 @@
+v 0.1
+  - API: Added basic spinlock based RTM implementation to the existing LibTM
+interface.
+  - API: Can now adjust transaction size (# of read/write accesses inside a HW RTM
+transaction), software fallback still uses a global lock on the entire array.
+  - Consistency / correctness was checked with global read and write counters
+that perform multiple reads inside a software critical region to check if any
+HW transactions committed in between.
+  - BUG: When conducting experiement with read only accesses inside a transaction.
+Having the else branch of the write access in the code (although not executed)
+still result in abnormally high amount of aborts.
+  - BUG: What is the proper way to perform read and write operations inside a
+transaction? with 1 loop but having branches or with 2 dedicated read/write
+loops?

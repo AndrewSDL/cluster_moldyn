@@ -1,0 +1,177 @@
+#ifndef __TM_H__
+#define __TM_H__
+
+#include "tm_general.h"
+#include "tm_scope.h"
+#include "tm_threads.h"
+
+#ifdef STATS
+# define TM_INIT();                     \
+  Mutex *tm_mutex; /*             \
+  unsigned int _total_started_txns = 0; \
+  unsigned int _total_aborts = 0;       \
+  unsigned int _abort_cdf = new unsigned int[_MAX_RETRIES]; */
+#else
+# define TM_INIT();                    \
+  Mutex tm_mutex;              
+#endif
+
+#ifdef FINE 
+
+# define BEGIN_TRANSACTION(current_mutex);  {\
+   Transaction tm_guard(current_mutex, MAX_RETRIES); \
+   tm_guard.TransactionStart();            
+
+# define END_TRANSACTION();		tm_guard.TransactionEnd();  }
+
+#else
+
+# define BEGIN_TRANSACTION();     \
+   Transaction tm_guard(tm_mutex, MAX_RETRIES); \
+   tm_guard.TransactionStart();
+
+# define END_TRANSACTION();		tm_guard.TransactionEnd();  
+
+#endif
+
+
+void* mgr_on_new( size_t size )
+{
+	void* ptr = malloc(size);
+	memset( ptr, 0, size );
+
+	return ptr;
+}
+
+class tm_obj
+{
+	public:
+		//[[transaction_callable]]
+		void* operator new(size_t size)		{	return mgr_on_new( size );	}
+
+		//[[transaction_callable]]
+		void* operator new[](size_t size)	{	return mgr_on_new( size );	}
+
+		//[[transaction_callable]]
+		void  operator delete(void* ptr)	{	free( ptr );		}
+
+		//[[transaction_callable]]
+		void  operator delete[](void* ptr)	{	free( ptr );		}
+};
+
+
+
+/**************************************************************************
+ *		TM_TYPE
+ **************************************************************************/
+
+#define _read_T( r_meta, r_addr )        \
+({                                        \
+        T resT;                                \
+        (*(T*)mgr_on_rd( r_meta, r_addr, sizeof(T), (ptr_t)&resT ));        \
+})
+#define read_T()                _read_T( ((ptr_t) __meta), ((ptr_t) &_t) )
+#define read_tm_T( tm_r )        _read_T( ((ptr_t)tm_r.__meta), ((ptr_t)&tm_r._t) )
+
+#define write_pT()                ((T*)mgr_on_wr( (ptr_t)__meta, (ptr_t)&_t, sizeof(T) ))
+
+template <typename T>
+class tm_type : public tm_obj
+{
+	  typedef tm_type<T> tm_T;
+    
+public:
+    T	_t;
+    Mutex *__lock;
+
+    tm_type() 				{}
+
+    tm_type( T const& r) : _t( r ), __lock(NULL)	{}
+
+    //reading
+    operator volatile T () const volatile	{return _t;}
+
+    //writing with regular type
+    T& operator = ( T const&  r )	{return (_t = r);	}
+
+    //writing with tm wrapped type
+    T& operator = ( tm_T const& tm_r )	{_t = tm_r._t; return _t;	}
+
+    //pre-increment
+    T& operator ++ ()			{T tt = _t;return _t = tt + 1;}
+
+    //pre-decrement
+    T& operator -- ()			{T tt = _t;return _t = tt - 1;}
+
+    //post-increment
+    T operator ++ (int)			{T tt = _t;return _t = tt + 1; return tt;}
+
+    //post-decrement
+    T operator -- (int)			{T tt = _t;return _t = tt - 1; return tt;}
+
+	/**********/
+    //
+	T&  operator += ( const  T&    r ){	T tt = _t;return _t = tt + r;}
+
+    //[[transaction_callable]]
+	T&  operator -= ( const  T&    r ){	T tt = _t;return _t = tt - r;}
+
+    //[[transaction_callable]]
+	T&  operator *= ( const  T&    r ){	T tt = _t;return _t = tt * r;}
+
+    //[[transaction_callable]]
+	T&  operator /= ( const T& r ){	T tt = _t;return _t = tt / r;}
+
+	/**********/
+    //[[transaction_callable]]
+	T&   operator += ( const tm_T& tm_r ){	T tt = _t;return _t = tt + tm_r._t;}
+
+    //[[transaction_callable]]
+	T&   operator -= ( const tm_T& tm_r ){	T tt = _t;return _t = tt - tm_r._t;}
+
+    //[[transaction_callable]]
+	T&   operator *= (const tm_T& tm_r ){	T tt = _t;return _t = tt * tm_r._t;}
+
+    //[[transaction_callable]]
+	T&   operator /= (const tm_T& tm_r ){	T tt = _t;return _t = tt / tm_r._t;}
+  
+  void assign_lock(Mutex *new_lock){__lock = new_lock;} 
+
+  void unassign_lock(){__lock = NULL;}
+
+  bool compare_lock(const tm_T& tm_r) {
+    if (__lock == NULL || tm_r.__lock == NULL)
+      return false;
+    return *(__lock) == *(tm_r.__lock);
+  }
+
+  bool check_lock(Mutex* mutex) {
+    if (__lock == NULL) return false;
+    return __lock == mutex;
+  }
+};
+
+
+/**************************************************************************
+ *		TYPE REDEFINITIONS
+ **************************************************************************/
+
+
+typedef	tm_type<char>			tm_char;
+typedef	tm_type<short>			tm_short;
+typedef	tm_type<int>			tm_int;
+typedef	tm_type<long>			tm_long;
+typedef	tm_type<long long>		tm_llong;
+
+typedef	tm_type<unsigned char>		tm_uchar;
+typedef	tm_type<unsigned short>		tm_ushort;
+typedef	tm_type<unsigned int>		tm_uint;
+typedef	tm_type<unsigned long>		tm_ulong;
+typedef	tm_type<unsigned long long>	tm_ullong;
+
+typedef	tm_type<float>			tm_float;
+typedef	tm_type<double>			tm_double;
+
+
+#endif	// __TM_H__
+

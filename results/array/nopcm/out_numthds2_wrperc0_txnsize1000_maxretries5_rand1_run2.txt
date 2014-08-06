@@ -1,0 +1,6 @@
+1: 4427
+2: 6
+3: 2
+4: 1
+5: 1
+started txns: 1000000, total aborts: 4437

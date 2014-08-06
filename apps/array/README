@@ -1,0 +1,66 @@
+Random array access application. 
+
+Mike Dai Wang, dai.wang AT mail.utoronto.ca
+
+Requirements:
+- Intel Haswell CPU with TSX support 
+- gcc 4.8 or another compiler with TSX support
+- Latest version of Hybrid LibTM library.
+
+To Make:
+../../make
+
+TO run:
+../../array
+
+Code Description:
+
+An array of integers will be randomly accessed according to a specific access
+pattern. The following variables are defined in the code:
+- Number of threads (N_TH)
+- Transaction size (N_ELEMENTS_TO_ACC)
+- Write ratio/percentage of writes (WR_PERCENTAGE)
+
+A transaction will be executed in each iteration of N_ITER total loop
+iterations. Each transaction accesses an element of the array (cnt) according
+to a generated access pattern.
+
+The access patterns are randomly generated according to the write ratio prior
+prior to the loop iterations. The access pattern array is 10x the size of
+our shared array (cnt) to provide additional randomness. It contains th
+the index of the element that will be accessed in the cnt array. We
+distinguish between write accesses and read accesses by assigning negative
+values in the to_acc array for writes. For example, if to_acc [3] = 5, it
+means that a transaction will read from cnt[5]; if to_acc [3] = -5, it means
+that a transaction will write to cnt[5].
+
+Each transaction will start from a _random_ place within the to_acc array; in
+other words, each transaction's access pattern will likely be different,
+depending on where it starts from within the to_acc array; that's the "base"
+variable. More specifically, each transaction, a random location in the
+to_acc array will be chosen (through the "base" variable), and the subsequent
+transaction will access the cnt array according to the patterns contained in
+the following N_PARTS_TO_ACC elements of the to_acc array, starting
+from to_acc[base]. Therefore, the transaction will access the locations
+contained in: to_acc[base], to_acc[base+1],... to_acc[base+N_PARTS_TO_ACC-1].
+
+
+Variables:
+
+aux = a throwaway variable; when we read from/write to the array, we need to
+read into/write from some variable; this is that variable; we don't care
+_what_ we read/write, just that we do read/write. So the contents of aux are
+irrelevant, always.
+
+_wrs = array that stores the number of writes
+
+dt = accumulates the total time spent in transactions (including the STM
+overhead)
+
+_dt = accumulates the total time spent _within_ a transaction (without the
+commit/abort overhead due to STM)
+
+_t_tx = the total number of transactions _started_ per thread
+t_tx = array that stores _t_tx for each thread
+_tx = the total number of transactions successfully _committed_ per thread
+tx = array that stores _tx for each thread
