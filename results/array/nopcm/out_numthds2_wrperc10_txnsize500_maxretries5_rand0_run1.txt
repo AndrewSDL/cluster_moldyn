@@ -1,6 +1,0 @@
-1: 1791
-2: 3
-3: 3
-4: 3
-5: 3
-started txns: 1000000, total aborts: 1803
