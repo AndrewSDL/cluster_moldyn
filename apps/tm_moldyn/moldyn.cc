@@ -86,8 +86,19 @@ extern int srandom();
 !============================================================================
 */
 
+#ifdef TM
 # define MOLDYN_DOUBLE double
 # define MOLDYN_INT    int
+
+TM_INIT();
+
+int MAX_RETRIES;
+int TXN_SIZE;
+#else
+# define MOLDYN_DOUBLE double
+# define MOLDYN_INT    int
+#endif
+
 
 Molecule *molecules;
 MOLDYN_DOUBLE *vh;
@@ -219,6 +230,20 @@ int InitSettings()
     // Dynamic memory allocation
     molecules = new Molecule[numMoles];
     vh = new MOLDYN_DOUBLE[numMoles * NDIM];
+
+#ifdef FINE
+# ifdef TM
+  //  for (i = 0; i < numMoles; ++i) 
+  //    molecules[i].lock = new Mutex(); 
+
+# else
+    mutex_list_pthread = new pthread_mutex_t[numMoles];
+
+    for (i = 0; i < numMoles; ++i) 
+      pthread_mutex_init(&mutex_list_pthread[i], NULL);
+# endif
+#endif
+
 
 #ifdef OLD_DS
     inter = new int[MAXINTERACT * 2];
@@ -500,14 +525,22 @@ int BuildNeigh( void* arg, int id )
 
 
 # ifdef FINE
+#  ifdef TM
+           BEGIN_TRANSACTION(tm_mutex);
+#  else
            pthread_mutex_lock (&mutex_ninter);
+#  endif
 # endif
            inter[INDX(ninter,0)] = i;
            inter[INDX(ninter,1)] = j;
            ++ninter;   
            if ( ninter >= MAXINTERACT) perror("MAXINTERACT limit");
 # ifdef FINE
+#  ifdef TM
+           END_TRANSACTION();
+#  else
            pthread_mutex_unlock(&mutex_ninter);
+#  endif
 # endif
         }  
 
@@ -684,7 +717,11 @@ int ComputeForces( void* arg, int id )
         forcey = yy*r148;
         forcez = zz*r148;
 # ifdef FINE
+#  ifdef TM
+        BEGIN_TRANSACTION(molecules[i].lock);
+#  else
         pthread_mutex_lock(&mutex_list_pthread[i]);
+#  endif
 # endif
 
         molecules[i].f_x  += forcex ;
@@ -692,8 +729,13 @@ int ComputeForces( void* arg, int id )
         molecules[i].f_z  += forcez ;
 
 # ifdef FINE
+#  ifdef TM
+        END_TRANSACTION();
+        BEGIN_TRANSACTION(molecules[k].lock);
+#  else
         pthread_mutex_unlock(&mutex_list_pthread[i]);
         pthread_mutex_lock(&mutex_list_pthread[k]);
+#  endif
 # endif
 
         molecules[k].f_x  -= forcex ;
@@ -701,15 +743,24 @@ int ComputeForces( void* arg, int id )
         molecules[k].f_z  -= forcez ;
 
 # ifdef FINE
+#  ifdef TM
+        END_TRANSACTION();
+        BEGIN_TRANSACTION(tm_mutex);
+#  else
         pthread_mutex_unlock(&mutex_list_pthread[k]);
         pthread_mutex_lock(&global_mutex1);
+#  endif
 # endif
  
         vir -= rd*r148 ;
         epot += (rrd6 - rrd3);
 
 # ifdef FINE
+#  ifdef TM
+        END_TRANSACTION();
+#  else
         pthread_mutex_unlock(&global_mutex1);
+#  endif
 # endif
 
       }
@@ -723,7 +774,11 @@ int ComputeForces( void* arg, int id )
         {
 
 # ifdef FINE
+#  ifdef TM
+        BEGIN_TRANSACTION(tm_mutex);
+#  else
         pthread_mutex_lock(&global_mutex1);
+#  endif
 # endif
  
 
@@ -731,7 +786,11 @@ int ComputeForces( void* arg, int id )
           epot += (rrd6 - rrd3);
 
 # ifdef FINE
+#  ifdef TM
+        END_TRANSACTION();
+#  else
         pthread_mutex_unlock(&global_mutex1);
+#  endif
 # endif
  
         }
@@ -786,7 +845,11 @@ int Update( void* arg, int id )
   vaverh = vaver * timeStep ;
   /* for ( i = 0; i < numMoles; i ++) */
   for ( i = (numMoles / NTHREADS ) * id; i < finish; ++i)
-  {    
+  {
+/* #ifdef TM
+	BEGIN_TRANSACTION();
+#endif
+*/     
     /* Compute Velocity */
 
     force_x  = molecules[i].f_x * timeStepSqHalf ;
@@ -828,10 +891,21 @@ int Update( void* arg, int id )
     molecules[i].z += velocity_z + force_z;
     if ( molecules[i].z < 0.0 )    molecules[i].z += side ;
 	  if ( molecules[i].z > side   ) molecules[i].z -= side ;
+
+/* #ifdef TM
+    END_TRANSACTION();
+#endif
+    */
   }
 
 #if defined(PTHREAD)
   pthread_mutex_lock (&global_mutex2);
+#elif TM
+# ifdef FINE
+  BEGIN_TRANSACTION(tm_mutex);
+# else
+  BEGIN_TRANSACTION();
+# endif
 #endif
 
           ekin += sum/timeStepSq;
@@ -857,6 +931,8 @@ int Update( void* arg, int id )
  
 #if defined(PTHREAD)
   pthread_mutex_unlock (&global_mutex2);
+#elif defined(TM)
+  END_TRANSACTION();
 #endif
 
   return 0;
@@ -912,6 +988,7 @@ void dump_values(char *s)
 #endif
 
 /* main work function for each thread */
+#if defined(PTHREAD)
 void * do_thread_work (void * _id) {
 
 
@@ -1003,6 +1080,66 @@ void * do_thread_work (void * _id) {
 
   return NULL;
 }
+#endif
+
+#ifdef TM
+void do_libtm_work(void) {
+
+  int tstep, i;
+
+  for ( tstep=0; tstep< NUMBER_TIMESTEPS; tstep++) 
+  {
+    vir  = 0.0;
+    epot = 0.0;
+    ekin = 0.0;
+    vel = 0.0;
+    count = 0.0;
+
+    if ( tstep % neighUpdate == 0) 
+	{
+# ifdef PRINT_COORDINATES
+      PrintCoordinates(numMoles); 
+# endif
+
+      ninter = 0;
+
+      PARALLEL_EXECUTE( NTHREADS, BuildNeigh, NULL );
+
+/*
+#ifdef OLD_DS
+      printf("number of interactions: %d\n", ninter);
+#else
+      int sum = 0;
+        for (i = 0; i < numMoles; ++i) sum += num_interactions[i];
+        printf("number of interactions: %d\n", sum/2);
+#endif
+ */
+
+# ifdef PRINT_INTERACTION_LIST     
+      PrintInteractionList(INPARAMS ninter);
+# endif 
+
+# ifdef MEASURE
+      PrintConnectivity();
+# endif
+    }
+#ifdef OLD_DS  
+  for (i = 0; i < numMoles; ++i) {
+      molecules[i].f_x = 0;
+      molecules[i].f_y = 0;
+      molecules[i].f_z = 0;
+  }  
+#endif
+	PARALLEL_EXECUTE( NTHREADS, ComputeForces, NULL );
+  
+	PARALLEL_EXECUTE( NTHREADS, Update, NULL );
+
+	PrintResults (INPARAMS tstep, (double)ekin, (double)epot, (double)vir,(double)vel,(double)count,numMoles,(int)ninter);
+  } 
+  return;
+}
+#endif
+
 
 /*
 !============================================================================
@@ -1025,12 +1162,24 @@ void * do_thread_work (void * _id) {
 
 int main( int argc, char *argv[])
 {
+
+#ifdef TM
+  if (argc < 4)
+  {
+    printf("Usage: ./moldyn NTHREADS MAX_RETRIES TXN_SIZE\n");
+    return 1;
+  }
+  NTHREADS = atoi(argv[1]);
+  MAX_RETRIES = atoi(argv[2]);
+  TXN_SIZE = atoi(argv[3]);
+#else
   if (argc < 2)
   {
     printf("Usage: ./moldyn NTHREADS\n");
     return 1;
   }
   NTHREADS = atoi(argv[1]);
+#endif
 
   intptr_t i; 
   int j;
@@ -1060,6 +1209,7 @@ int main( int argc, char *argv[])
   vel = 0.0;
   count = 0.0;
 
+#if defined(PTHREAD)
   for( i = 1; i < NTHREADS; i++ )
     pthread_create( &threads[i-1], &attr, do_thread_work, (void*)i );
 
@@ -1067,6 +1217,14 @@ int main( int argc, char *argv[])
 
   for( i = 1; i < NTHREADS; i++ )
     pthread_join( threads[i-1], NULL );
+#else
+  CREATE_TM_THREADS( NTHREADS );
+
+  do_libtm_work();
+
+  DESTROY_TM_THREADS( NTHREADS );
+#endif
+  
 
   printf("\n");
 

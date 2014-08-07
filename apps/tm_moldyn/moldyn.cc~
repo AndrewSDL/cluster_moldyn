@@ -3,12 +3,20 @@
 #include <math.h>
 #include <stdio.h>
 
-#include <immintrin.h>
-#include "../../src/tm.h"
-
-#ifdef OOP
-#include "./molecule.h"
+#if defined(PTHREAD)
+# include <sched.h>
+# include <stdlib.h>
 #endif
+
+#ifdef TM
+# include "../../src/tm.h"
+# include <immintrin.h>
+#elif PTHREAD
+# include "../../src/barrier.h"
+# include "../../src/bitset.h"
+#endif
+
+#include "./molecule.h"
 
 #define LOCAL       /* Such a function that changes no global vars */
 #define INPARAMS    /* All parameters following this are 'in' params  */
@@ -18,7 +26,11 @@
 #define SQR(a)   ((a)*(a))
 #define DRAND(a)  drand_x(a)
 
+volatile int num_aborts = 0;
+
+#if defined(PTHREAD) || defined(TM)
 int NTHREADS;
+#endif
 
 #define NDIM 3
 
@@ -74,25 +86,26 @@ extern int srandom();
 !============================================================================
 */
 
-#define MOLDYN_DOUBLE double
-#define MOLDYN_INT    int
+#ifdef TM
+# define MOLDYN_DOUBLE double
+# define MOLDYN_INT    int
 
 TM_INIT();
 
 int MAX_RETRIES;
 int TXN_SIZE;
-
-#ifdef OOP
-Molecule *molecules;
 #else
-// main data structures for tracking position, forces and velocities
-MOLDYN_DOUBLE *x;
-MOLDYN_DOUBLE *f;
+# define MOLDYN_DOUBLE double
+# define MOLDYN_INT    int
 #endif
 
+
+Molecule *molecules;
 MOLDYN_DOUBLE *vh;
 
 // Replaced old data structure to track interactions
+
+
 #ifdef OLD_DS
 int *inter;
 #else
@@ -112,26 +125,46 @@ int connect[NUM_PARTICLES];
 !======================  GLOBAL VARIABLES ===================================
 */
 
-double      side;                  /*  length of side of box                 */ 
-double      sideHalf;              /*  1/2 of side                           */
-double      cutoffRadius;          /*  cuttoff distance for interactions     */
-int       neighUpdate;           /*  timesteps between interaction updates */
-double      perturb;               /*  perturbs initial coordinates          */ 
+double			side;                  /*  length of side of box                 */ 
+double			sideHalf;              /*  1/2 of side                           */
+double			cutoffRadius;          /*  cuttoff distance for interactions     */
+int				neighUpdate;           /*  timesteps between interaction updates */
+double			perturb;               /*  perturbs initial coordinates          */ 
 
-double      timeStep;              /*  length of each timestep   */
-double      timeStepSq;            /*  square of timestep        */
-double      timeStepSqHalf;        /*  1/2 of square of timestep */
+double			timeStep;              /*  length of each timestep   */
+double			timeStepSq;            /*  square of timestep        */
+double			timeStepSqHalf;        /*  1/2 of square of timestep */
 
-int       numMoles;              /*  number of molecules                   */
+int				numMoles;              /*  number of molecules                   */
 MOLDYN_INT      ninter;                /*  number of interacting molecules pairs  */
-double      vaver;                 /*                                        */
+double			vaver;                 /*                                        */
 
 MOLDYN_DOUBLE   epot;                  /*  The potential energy      */
 MOLDYN_DOUBLE   vir;                   /*  The virial  energy        */
 MOLDYN_DOUBLE   count, vel ;
 MOLDYN_DOUBLE   ekin;
 
-int       n3;
+int				n3;
+
+#ifdef PTHREAD
+barrier_t barrier;
+
+/* mutex to protect global scalars in ComputeForces(): vir, epot */
+pthread_mutex_t global_mutex1 = PTHREAD_MUTEX_INITIALIZER;
+/* mutex to protect global scalars in ComputeKEVel(): count, vel, ekin */
+pthread_mutex_t global_mutex2 = PTHREAD_MUTEX_INITIALIZER;
+/* mutex to protect global scalar ninter and global array inter */
+pthread_mutex_t mutex_ninter = PTHREAD_MUTEX_INITIALIZER;
+
+# ifdef FINE
+pthread_mutex_t *mutex_list_pthread;
+# else
+/* mutex protection for x and f */
+pthread_mutex_t mutex_x = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mutex_f = PTHREAD_MUTEX_INITIALIZER;
+# endif
+#endif
+
 
 /* ----------- UTILITY ROUTINES --------------------------- */
 
@@ -194,16 +227,23 @@ int InitSettings()
     int i;
     
     numMoles  = 4*BOXSIZE*BOXSIZE*BOXSIZE;
-
+    // Dynamic memory allocation
+    molecules = new Molecule[numMoles];
     vh = new MOLDYN_DOUBLE[numMoles * NDIM];
 
-    // Dynamic memory allocation
-#ifdef OOP 
-    molecules = new Molecule[numMoles];
-#else
-    x = new MOLDYN_DOUBLE[numMoles * NDIM];
-    f = new MOLDYN_DOUBLE[numMoles * NDIM];
+#ifdef FINE
+# ifdef TM
+  //  for (i = 0; i < numMoles; ++i) 
+  //    molecules[i].lock = new Mutex(); 
+
+# else
+    mutex_list_pthread = new pthread_mutex_t[numMoles];
+
+    for (i = 0; i < numMoles; ++i) 
+      pthread_mutex_init(&mutex_list_pthread[i], NULL);
+# endif
 #endif
+
 
 #ifdef OLD_DS
     inter = new int[MAXINTERACT * 2];
@@ -250,7 +290,7 @@ int InitSettings()
    fprintf(stdout,"\n interaction-list updated every..   %d steps",neighUpdate);
    fprintf(stdout,"\n total no. of steps .............   %d ",NUMBER_TIMESTEPS);
    fprintf(stdout,
-     "\n TimeStep   K.E.        P.E.        Energy    Temp.     Pres.    Vel.    rp ");
+     "\n\n TimeStep   K.E.        P.E.        Energy    Temp.     Pres.    Vel.    rp ");
    fprintf(stdout,
      "\n -------- --------   ----------   ----------  -------  -------  ------  ------");
 #endif
@@ -271,14 +311,13 @@ void InitCoordinates(int numMoles, int siz, double perturb)
 {
  int n, k, ij,  j, i, npoints;
  double tmp = 0;
-
+ printf("\nperturb is: %f\n", perturb);
    npoints = siz * siz * siz ; 
    for ( n =0; n< npoints; n++) {
       k   = n % siz ;
       j   = (int)((n-k)/siz) % siz;
       i   = (int)((n - k - j*siz)/(siz*siz)) % siz ; 
 
-#ifdef OOP
 /* mike: this is why numParticles is 4 x size x size x size
    the initialization does 4 particles at a time.
 */
@@ -298,26 +337,9 @@ void InitCoordinates(int numMoles, int siz, double perturb)
       molecules[n+npoints*3].x = i*perturb ;
       molecules[n+npoints*3].y = j*perturb + perturb * 0.5 ;
       molecules[n+npoints*3].z = k*perturb + perturb * 0.5;
-
-#else
-
-      x[IND(0,n)] = i*perturb ;
-      x[IND(1,n)] = j*perturb ;
-      x[IND(2,n)] = k*perturb ;
-
-      x[IND(0,n+npoints)] = i*perturb + perturb * 0.5 ;
-      x[IND(1,n+npoints)] = j*perturb + perturb * 0.5;
-      x[IND(2,n+npoints)] = k*perturb ;
-
-      x[IND(0,n+npoints*2)] = i*perturb + perturb * 0.5 ;
-      x[IND(1,n+npoints*2)] = j*perturb ;
-      x[IND(2,n+npoints*2)] = k*perturb + perturb * 0.5;
-
-      x[IND(0,n+npoints*3)] = i*perturb ;
-      x[IND(1,n+npoints*3)] = j*perturb + perturb * 0.5 ;
-      x[IND(2,n+npoints*3)] = k*perturb + perturb * 0.5;
-#endif
     }
+
+	PrintCoordinates(16);
 } 
 
 /*
@@ -421,55 +443,32 @@ int  InitForces()
 {
 int i;
 
-#ifdef OOP
-
    for ( i=0; i < numMoles; ++i ) {
      molecules[i].f_x = 0.0 ;
      molecules[i].f_y = 0.0 ;
      molecules[i].f_z = 0.0 ;
    }
-
-#else
-
-   for ( i=0; i<n3; i++ ) {
-     f[i] = 0.0 ;
-   } 
-#endif
 }
 
-int UpdateCoordinates( void* arg, int id )
+int FirstCoordinates()
 {
-    int i;
- 
-    int finish;
-    if (id == NTHREADS - 1) finish = n3;
-    else finish = (n3 / NTHREADS) * (id + 1);
+	int i;
 
-#ifdef OOP
-  for ( i = (numMoles / NTHREADS ) * id; i < (numMoles / NTHREADS) * (id + 1); ++i) {
-    molecules[i].x += vh[IND(0,i)];
+	for ( i = 0; i < numMoles; ++i) {
+		molecules[i].x += vh[IND(0,i)];
     if ( molecules[i].x < 0.0 )    molecules[i].x += side ;
-    if ( molecules[i].x > side   ) molecules[i].x -= side ;
+		if ( molecules[i].x > side   ) molecules[i].x -= side ;
 
     molecules[i].y += vh[IND(1,i)];
     if ( molecules[i].y < 0.0 )    molecules[i].y += side ;
-    if ( molecules[i].y > side   ) molecules[i].y -= side ;
+		if ( molecules[i].y > side   ) molecules[i].y -= side ;
 
     molecules[i].z += vh[IND(2,i)];
     if ( molecules[i].z < 0.0 )    molecules[i].z += side ;
-    if ( molecules[i].z > side   ) molecules[i].z -= side ;
-  }
+		if ( molecules[i].z > side   ) molecules[i].z -= side ;
 
-#else
-    for ( i = (n3 / NTHREADS) * id; i < finish; i++) {
-        x[i] = x[i] + vh[i] + f[i];
-        if ( x[i] < 0.0 )    x[i] = x[i] + side ;
-        if ( x[i] > side   ) x[i] = x[i] - side ;
-        vh[i] = vh[i] + f[i];
-        f[i]  = 0.0;
-    }
-#endif
 
+	}
 }
 
 /*---------- UPDATE ROUTINES HERE               ------------------*/
@@ -480,11 +479,7 @@ void PrintCoordinates(INPARAMS int numMoles)
   printf("%d\n", numMoles);
   for (i=0;i<numMoles;i++)
    {
-#ifdef OOP
      printf("%d: %f,%f,%f\n", i, (double)molecules[i].x, (double)molecules[i].y,(double)molecules[i].z);
-#else
-     printf("%f,%f,%f\n", (double)x[IND(0,i)], (double)x[IND(1,i)],(double)x[IND(2,i)]);
-#endif
    }
 }
 
@@ -512,36 +507,43 @@ int BuildNeigh( void* arg, int id )
 #endif
   cutoffSquare  = (cutoffRadius * TOLERANCE)*(cutoffRadius * TOLERANCE); 
 
-
-/* #if defined(OLD_DS)
-    END_TRANSACTION();
+#if defined(TM) && !defined(FINE) && defined(OLD_DS)
+    BEGIN_TRANSACTION();
 #endif
-*/
+    if (!_xtest()) ++num_aborts;
+
+#if defined(PTHREAD) && !defined(FINE) && defined(OLD_DS)
+  pthread_mutex_lock (&mutex_ninter);
+#endif
+
   for ( i = (numMoles / NTHREADS ) * id; i < (numMoles / NTHREADS) * (id + 1); ++i)
   {
 #ifdef OLD_DS
     for ( j = i+1; j<numMoles; j++ ) {
-
-# ifdef OOP
         rd = Foo ( molecules[i].x, molecules[i].y, molecules[i].z, 
                    molecules[j].x, molecules[j].y, molecules[j].z); 
-# else
-        rd = Foo ( x[IND(0,i)], x[IND(1,i)], x[IND(2,i)], 
-                   x[IND(0,j)], x[IND(1,j)], x[IND(2,j)]); 
-# endif
-
    
         if ( rd <= cutoffSquare) {
 
-           BEGIN_TRANSACTION();
 
+# ifdef FINE
+#  ifdef TM
+           BEGIN_TRANSACTION(tm_mutex);
+#  else
+           pthread_mutex_lock (&mutex_ninter);
+#  endif
+# endif
            inter[INDX(ninter,0)] = i;
            inter[INDX(ninter,1)] = j;
            ++ninter;   
-
-           END_TRANSACTION();
-
            if ( ninter >= MAXINTERACT) perror("MAXINTERACT limit");
+# ifdef FINE
+#  ifdef TM
+           END_TRANSACTION();
+#  else
+           pthread_mutex_unlock(&mutex_ninter);
+#  endif
+# endif
         }  
 
      } 
@@ -552,14 +554,8 @@ int BuildNeigh( void* arg, int id )
     for ( k = 0; k < numMoles; k++ ) {
       if (i == k) continue;
 
-# ifdef OOP
       rd = Foo ( molecules[i].x, molecules[i].y, molecules[i].z, 
                    molecules[k].x, molecules[k].y, molecules[k].z); 
-# else
-      rd = Foo ( (double)x[IND(0,i)], (double)x[IND(1,i)], (double)x[IND(2,i)], 
-                 (double)x[IND(0,k)], (double)x[IND(1,k)], (double)x[IND(2,k)]); 
-# endif
-
      
       if ( rd <= cutoffSquare) 
       {
@@ -570,15 +566,15 @@ int BuildNeigh( void* arg, int id )
     } 
 #endif
 
-    
-
  }
-/*
- #if defined(OLD_DS)
+
+#if defined(TM) && !defined(FINE) && defined(OLD_DS)
     END_TRANSACTION();
 #endif
-*/
 
+#if defined(PTHREAD) && !defined(FINE) && defined(OLD_DS)
+    pthread_mutex_unlock (&mutex_ninter);
+#endif
  
   return 0; 
 }
@@ -592,6 +588,50 @@ void PrintInteractionList(INPARAMS int ninter)
      printf("%d %d\n", inter[INDX(i,0)], inter[INDX(i,1)]);
    }
 }
+
+#ifdef MEASURE
+void PrintConnectivity()
+{
+  int ii, i;
+  int min, max; 
+  float sum, sumsq, stdev, avg;
+
+  bzero((char *)connect, sizeof(int) * numMoles);
+
+  for (ii=0;ii<ninter;ii++)
+    {
+      assert(inter[INDX(ii,0)] < numMoles);
+      assert(inter[INDX(ii,1)] < numMoles);
+
+      connect[inter[INDX(ii,0)]]++;
+      connect[inter[INDX(ii,1)]]++;
+    }
+  
+  sum = 0.0;
+  sumsq = 0.0;
+
+  sum = connect[0];
+  sumsq = SQR(connect[0]);
+  min = connect[0];
+  max = connect[0];
+  for (i=1;i<numMoles;i++)
+    {
+      sum += connect[i];
+      sumsq += SQR(connect[i]);
+      if (min > connect[i])
+  min = connect[i];
+      if (max < connect[i])
+  max = connect[i];
+    }
+
+  avg = sum / numMoles;
+  stdev = sqrt((sumsq / numMoles) - SQR(avg));
+  
+  printf("avg = %4.1lf, dev = %4.1lf, min = %d, max = %d\n", 
+   avg, stdev, min, max);
+  
+}
+#endif
 
 /*
 !============================================================================
@@ -613,12 +653,8 @@ int ComputeForces( void* arg, int id )
   double xx, yy, zz, rd, rrd, rrd2, rrd3, rrd4, rrd5, rrd6, rrd7, r148;
   double forcex, forcey, forcez;
   int    i,j,k;
-  double vir_tmp, epot_tmp;
 
   cutoffSquare = cutoffRadius*cutoffRadius ;
-
-  vir_tmp  = 0.0;
-  epot_tmp = 0.0;
   
   int finish_outer, finish_inner;
   if (id == NTHREADS - 1) {
@@ -629,7 +665,14 @@ int ComputeForces( void* arg, int id )
     finish_inner = (numMoles / NTHREADS) * (id + 1);
   }
 
- //BEGIN_TRANSACTION();
+#if defined(TM) && !defined(FINE)
+    BEGIN_TRANSACTION();
+    if (!_xtest()) ++num_aborts;
+#endif
+
+#if defined(PTHREAD) && !defined(FINE)
+    pthread_mutex_lock (&global_mutex1);
+#endif
 
 #ifdef OLD_DS
   int ii;
@@ -640,26 +683,18 @@ int ComputeForces( void* arg, int id )
 #else
    for ( i = (numMoles / NTHREADS ) * id; i < finish_inner; ++i) {
 #endif
-     
 
 #ifndef OLD_DS
     forcex = 0;
     forcey = 0;
     forcez = 0;
-
     for (j = 0; j < num_interactions[i]; ++j) {
       k = inter[i][j];
 #endif
 
-#ifdef OOP
       xx = molecules[i].x - molecules[k].x;
       yy = molecules[i].y - molecules[k].y;
       zz = molecules[i].z - molecules[k].z;
-#else
-      xx = x[IND(0,i)] - x[IND(0,k)];
-      yy = x[IND(1,i)] - x[IND(1,k)];
-      zz = x[IND(2,i)] - x[IND(2,k)];
-#endif
  
       if (xx < -sideHalf) xx += side;
       if (yy < -sideHalf) yy += side;
@@ -679,187 +714,232 @@ int ComputeForces( void* arg, int id )
         rrd7  = rrd6*rrd ;
         r148  = rrd7 - 0.5 * rrd4 ;
 
+#ifdef OLD_DS
         forcex = xx*r148;
         forcey = yy*r148;
         forcez = zz*r148;
+# ifdef FINE
+#  ifdef TM
+        BEGIN_TRANSACTION(molecules[i].lock);
+#  else
+        pthread_mutex_lock(&mutex_list_pthread[i]);
+#  endif
+# endif
 
-#ifdef OLD_DS
-
-BEGIN_TRANSACTION();
-
-# ifdef OOP
         molecules[i].f_x  += forcex ;
         molecules[i].f_y  += forcey ;
         molecules[i].f_z  += forcez ;
-# else
-        f[IND(0,i)]  += forcex ;
-        f[IND(1,i)]  += forcey ;
-        f[IND(2,i)]  += forcez ;
+
+# ifdef FINE
+#  ifdef TM
+        END_TRANSACTION();
+        BEGIN_TRANSACTION(molecules[k].lock);
+#  else
+        pthread_mutex_unlock(&mutex_list_pthread[i]);
+        pthread_mutex_lock(&mutex_list_pthread[k]);
+#  endif
 # endif
 
-
-# ifdef OOP
         molecules[k].f_x  -= forcex ;
         molecules[k].f_y  -= forcey ;
         molecules[k].f_z  -= forcez ;
 
-# else
-        f[IND(0,k)]  -= forcex ;
-        f[IND(1,k)]  -= forcey ;
-        f[IND(2,k)]  -= forcez ;
+# ifdef FINE
+#  ifdef TM
+        END_TRANSACTION();
+        BEGIN_TRANSACTION(tm_mutex);
+#  else
+        pthread_mutex_unlock(&mutex_list_pthread[k]);
+        pthread_mutex_lock(&global_mutex1);
+#  endif
 # endif
-
-END_TRANSACTION();
  
-        vir_tmp  -= rd*r148 ;
-        epot_tmp += (rrd6 - rrd3);
+        vir -= rd*r148 ;
+        epot += (rrd6 - rrd3);
+
+# ifdef FINE
+#  ifdef TM
+        END_TRANSACTION();
+#  else
+        pthread_mutex_unlock(&global_mutex1);
+#  endif
+# endif
 
       }
 
 #else
-
-# ifdef OOP
-        molecules[i].f_x  += forcex ;
-        molecules[i].f_y  += forcey ;
-        molecules[i].f_z  += forcez ;
-# else
-        f[IND(0,i)]  += forcex ;
-        f[IND(1,i)]  += forcey ;
-        f[IND(2,i)]  += forcez ;
-# endif
+        forcex += xx*r148;
+        forcey += yy*r148;
+        forcez += zz*r148;
         
         if (i < k)
         {
-            vir_tmp  -= rd*r148 ;
-            epot_tmp += (rrd6 - rrd3);
+
+# ifdef FINE
+#  ifdef TM
+        BEGIN_TRANSACTION(tm_mutex);
+#  else
+        pthread_mutex_lock(&global_mutex1);
+#  endif
+# endif
+ 
+
+          vir -= rd*r148 ;
+          epot += (rrd6 - rrd3);
+
+# ifdef FINE
+#  ifdef TM
+        END_TRANSACTION();
+#  else
+        pthread_mutex_unlock(&global_mutex1);
+#  endif
+# endif
+ 
         }
       }
     }
+
+    molecules[i].f_x  = forcex;
+    molecules[i].f_y  = forcey;
+    molecules[i].f_z  = forcez;
+  
+#endif
+}
+ 
+#if defined(TM) && !defined(FINE)
+    END_TRANSACTION();
 #endif
 
-}
-
-BEGIN_TRANSACTION();
-    vir  += vir_tmp ;
-    epot += epot_tmp;
- 
-END_TRANSACTION();
-
+#if defined(PTHREAD) && !defined(FINE)
+    pthread_mutex_unlock (&global_mutex1);
+#endif
   return 0;
 }
 
 /*
 !============================================================================
-!  Function : UpdateVelocities
+!  Function : Update
+!  Purpose  :
+!       Updates the everything 
 !============================================================================
 */
 
-int UpdateVelocities( void* arg, int id ){
-    int i;
+//we should use dynamic scheduling here
+int Update( void* arg, int id )
+{
+  int i,j;
 
-    int finish;
-    if (id == NTHREADS - 1) finish = numMoles;
-    else finish = (numMoles / NTHREADS) * (id + 1);
+  double vaverh, sq;
 
-    for ( i = (numMoles / NTHREADS ) * id; i < finish; i++) {
-         
-#ifdef OOP
+  double sum = 0.0;
+  double velocity = 0.0;
+  double counter = 0.0;
 
-        molecules[i].f_x  = molecules[i].f_x * timeStepSqHalf ;
-        molecules[i].f_y  = molecules[i].f_y * timeStepSqHalf ;
-        molecules[i].f_z  = molecules[i].f_z * timeStepSqHalf ;
-   
-
-        vh[ IND(0,i) ] += molecules[i].f_x;
-        vh[ IND(1,i) ] += molecules[i].f_y;
-        vh[ IND(2,i) ] += molecules[i].f_z;
-
-#else
-        f[IND(0,i)]  = f[IND(0,i)] * timeStepSqHalf ;
-        f[IND(1,i)]  = f[IND(1,i)] * timeStepSqHalf ;
-        f[IND(2,i)]  = f[IND(2,i)] * timeStepSqHalf ;
-               
-        vh[ IND(0,i) ] += f[ IND(0,i) ];
-        vh[ IND(1,i) ] += f[ IND(1,i) ];
-        vh[ IND(2,i) ] += f[ IND(2,i) ];
+  double force_x, force_y, force_z;
+  double velocity_x, velocity_y, velocity_z;
+  double velocity_x_sq, velocity_y_sq, velocity_z_sq;
+  
+  
+  int finish;
+  if (id == NTHREADS - 1) finish = numMoles;
+  else finish = (numMoles / NTHREADS) * (id + 1);
+ 
+  vaverh = vaver * timeStep ;
+  /* for ( i = 0; i < numMoles; i ++) */
+  for ( i = (numMoles / NTHREADS ) * id; i < finish; ++i)
+  {
+/* #ifdef TM
+	BEGIN_TRANSACTION();
 #endif
-        
-    }
+*/     
+    /* Compute Velocity */
 
+    force_x  = molecules[i].f_x * timeStepSqHalf ;
+    force_y  = molecules[i].f_y * timeStepSqHalf ;
+    force_z  = molecules[i].f_z * timeStepSqHalf ;
 
-    return 0;
-}
+    velocity_x  = vh[ IND(0,i) ] + force_x ;
+    velocity_y  = vh[ IND(1,i) ] + force_y ;
+    velocity_z  = vh[ IND(2,i) ] + force_z ;
 
-/*
-!============================================================================
-!  Function :  ComputeKE()
-!============================================================================
-*/
+    velocity_x_sq = SQR(velocity_x);
+    velocity_y_sq = SQR(velocity_y);
+    velocity_z_sq = SQR(velocity_z);
 
-int ComputeKE( void* arg, int id ){
-    double sum = 0.0;
-    int    i;
+    /* Compute KEVel */
+    sum += velocity_x_sq;
+    sum += velocity_y_sq;
+    sum += velocity_z_sq;
 
-    int finish;
-    if (id == NTHREADS - 1) finish = numMoles;
-    else finish = (numMoles / NTHREADS) * (id + 1);
-
+    sq = SQRT(  velocity_x_sq + velocity_y_sq + velocity_z_sq );
+ 
+    if ( sq > vaverh ) counter += 1.0 ;
     
+    velocity += sq ; 
 
-    for ( i = (numMoles / NTHREADS ) * id; i < finish; i++) {
+/* velocity_* is already vh[ * ] + forcex ; */
+    vh[IND(0,i)] = velocity_x + force_x;
+    vh[IND(1,i)] = velocity_y + force_y;
+    vh[IND(2,i)] = velocity_z + force_z;
 
-        sum = sum + vh[ IND(0,i) ] * vh[ IND(0,i) ]; 
-        sum = sum + vh[ IND(1,i) ] * vh[ IND(1,i) ]; 
-        sum = sum + vh[ IND(2,i) ] * vh[ IND(2,i) ]; 
+    molecules[i].x += velocity_x + force_x;
+    if ( molecules[i].x < 0.0 )    molecules[i].x += side ;
+    if ( molecules[i].x > side   ) molecules[i].x -= side ;
 
-    } 
-    BEGIN_TRANSACTION();
-    ekin += sum/timeStepSq ;
+    molecules[i].y += velocity_y + force_y;
+    if ( molecules[i].y < 0.0 )    molecules[i].y += side ;
+	  if ( molecules[i].y > side   ) molecules[i].y -= side ;
 
+    molecules[i].z += velocity_z + force_z;
+    if ( molecules[i].z < 0.0 )    molecules[i].z += side ;
+	  if ( molecules[i].z > side   ) molecules[i].z -= side ;
+
+/* #ifdef TM
     END_TRANSACTION();
+#endif
+    */
+  }
 
-    return 0;
+#if defined(PTHREAD)
+  pthread_mutex_lock (&global_mutex2);
+#elif TM
+# ifdef FINE
+  BEGIN_TRANSACTION(tm_mutex);
+# else
+  BEGIN_TRANSACTION();
+# endif
+#endif
+
+          ekin += sum/timeStepSq;
+
+# if defined(PTHREAD) && defined(FINE)
+          pthread_mutex_unlock(&global_mutex2);
+# endif
+ 
+ 
+# if defined(PTHREAD) && defined(FINE)
+           pthread_mutex_lock (&global_mutex2);
+# endif
+           vel += velocity/timeStep;
+
+# if defined(PTHREAD) && defined(FINE)
+           pthread_mutex_unlock(&global_mutex2);
+# endif
+
+# if defined(PTHREAD) && defined(FINE)
+           pthread_mutex_lock (&global_mutex2);
+# endif
+           count += counter;
+ 
+#if defined(PTHREAD)
+  pthread_mutex_unlock (&global_mutex2);
+#elif defined(TM)
+  END_TRANSACTION();
+#endif
+
+  return 0;
 }
 
-
-/*
-!============================================================================
-!  Function :  ComputeAvgVel()
-!============================================================================
-*/
-
-int ComputeAvgVel( void* arg, int id ) {
-    double vaverh, velocity, counter, sq;
-    int    i;
-
-    vaverh = vaver * timeStep ;
-    velocity    = 0.0 ;
-    counter     = 0.0 ;
-    
-    int finish;
-    if (id == NTHREADS - 1) finish = numMoles;
-    else finish = (numMoles / NTHREADS) * (id + 1);
-
-    
-
-    for ( i = (numMoles / NTHREADS ) * id; i < finish; i++) {
-       
-        sq = SQRT(  SQR(vh[IND(0,i)]) + SQR(vh[IND(1,i)]) + SQR(vh[IND(2,i)])  );
-
-        if ( sq > vaverh ) 
-            counter += 1.0 ;
-        velocity += sq ;
-
-    }  
-
-    BEGIN_TRANSACTION();
-    vel += (velocity/timeStep);
-    count += counter;
-
-    END_TRANSACTION();
-
-    return 0;
-}
 
 /*
 !=============================================================
@@ -897,28 +977,120 @@ void dump_values(char *s)
   printf("\n%s\n", s);
   for (i=0;i<n3/3;i++)
     {
-#ifdef OOP
       printf("%d: coord = (%lf, %lf, %lf), vel = (%lf, %lf, %lf), force = (%lf, %lf, %lf)\n", 
-       i, (double)molecules[i].x, (double)molecules[i].y, (double)molecules[i].z, 
-       (double)vh[IND(0,i)], (double)vh[IND(1,i)], (double)vh[IND(2,i)], 
+	     i, (double)molecules[i].x, (double)molecules[i].y, (double)molecules[i].z, 
+	     (double)vh[IND(0,i)], (double)vh[IND(1,i)], (double)vh[IND(2,i)],
        (double)molecules[i].f_x, (double)molecules[i].f_y, (double)molecules[i].f_z);      
-#else
-      printf("%d: coord = (%lf, %lf, %lf), vel = (%lf, %lf, %lf), force = (%lf, %lf, %lf)\n", 
-       i, (double)x[IND(0,i)], (double)x[IND(1,i)], (double)x[IND(2,i)], 
-       (double)vh[IND(0,i)], (double)vh[IND(1,i)], (double)vh[IND(2,i)], 
-       (double)f[IND(0,i)], (double)f[IND(1,i)], (double)f[IND(2,i)]); 
-#endif
     }
 }
 
+
+#ifdef coredump
+#define WITH_SMT
+#endif
+
+/* main work function for each thread */
+#if defined(PTHREAD)
+void * do_thread_work (void * _id) {
+
+
+  intptr_t id = (intptr_t) _id;
+  int tstep, i;
+
+  cpu_set_t mask;
+  CPU_ZERO( &mask );
+# ifdef WITH_SMT
+	CPU_SET( id*2, &mask );
+# else
+	CPU_SET( id, &mask );
+# endif
+  sched_setaffinity(0, sizeof(mask), &mask);
+
+  for ( tstep=0; tstep< NUMBER_TIMESTEPS; tstep++) 
+  {
+    barrier_wait (&barrier); 
+
+    vir  = 0.0;
+    epot = 0.0;
+    ekin = 0.0;
+    vel = 0.0;
+    count = 0.0;
+
+    barrier_wait (&barrier);
+
+    if ( tstep % neighUpdate == 0) 
+   	{
+      barrier_wait (&barrier);
+
+      if (id == 0) {
+
+# ifdef PRINT_COORDINATES
+		PrintCoordinates(numMoles); 
+# endif
+		ninter = 0;
+      }
+
+#ifndef OLD_DS
+      for (i = id; i < numMoles; i += NTHREADS) {
+         num_interactions [i] = 0;
+      }
+#endif
+      barrier_wait (&barrier);
+
+      BuildNeigh (NULL, id);
+
+      barrier_wait (&barrier);
+
+      if (id == 0) {
+# ifdef PRINT_INTERACTION_LIST     
+		PrintInteractionList(INPARAMS ninter);
+# endif 
+
+# ifdef MEASURE
+		PrintConnectivity();
+# endif
+      }
+      barrier_wait (&barrier);
+    }
+
+#ifdef OLD_DS
+    if (id == 0) {
+      for (i = 0; i < numMoles; ++i) {
+          molecules[i].f_x = 0;
+          molecules[i].f_y = 0;
+          molecules[i].f_z = 0;
+      }
+    }
+
+    barrier_wait (&barrier);
+#endif
+   
+	
+    ComputeForces (NULL, id);
+
+    barrier_wait (&barrier);        
+
+    Update(NULL, id);
+
+    barrier_wait (&barrier);
+
+    if (id == 0) {
+      PrintResults (INPARAMS tstep, (double)ekin, (double)epot, (double)vir,(double)vel,(double)count,numMoles,(int)ninter);
+	  }
+    
+  } 
+
+  return NULL;
+}
+#endif
+
+#ifdef TM
 void do_libtm_work(void) {
 
   int tstep, i;
 
   for ( tstep=0; tstep< NUMBER_TIMESTEPS; tstep++) 
   {
-    PARALLEL_EXECUTE( NTHREADS, UpdateCoordinates, NULL );
-    
     vir  = 0.0;
     epot = 0.0;
     ekin = 0.0;
@@ -926,7 +1098,7 @@ void do_libtm_work(void) {
     count = 0.0;
 
     if ( tstep % neighUpdate == 0) 
-  {
+	{
 # ifdef PRINT_COORDINATES
       PrintCoordinates(numMoles); 
 # endif
@@ -934,6 +1106,16 @@ void do_libtm_work(void) {
       ninter = 0;
 
       PARALLEL_EXECUTE( NTHREADS, BuildNeigh, NULL );
+
+/*
+#ifdef OLD_DS
+      printf("number of interactions: %d\n", ninter);
+#else
+      int sum = 0;
+        for (i = 0; i < numMoles; ++i) sum += num_interactions[i];
+        printf("number of interactions: %d\n", sum/2);
+#endif
+ */
 
 # ifdef PRINT_INTERACTION_LIST     
       PrintInteractionList(INPARAMS ninter);
@@ -943,35 +1125,22 @@ void do_libtm_work(void) {
       PrintConnectivity();
 # endif
     }
-
 #ifdef OLD_DS  
-# ifdef OOP
   for (i = 0; i < numMoles; ++i) {
       molecules[i].f_x = 0;
       molecules[i].f_y = 0;
       molecules[i].f_z = 0;
   }  
-# else  
-  for (i = 0; i < numMoles; ++i) {
-      f[IND(0,i)] = 0;
-      f[IND(1,i)] = 0;
-      f[IND(2,i)] = 0;
-  }
-# endif
 #endif
-
-  PARALLEL_EXECUTE( NTHREADS, ComputeForces, NULL );
-
-  PARALLEL_EXECUTE( NTHREADS, UpdateVelocities, NULL );
-
-  PARALLEL_EXECUTE( NTHREADS, ComputeKE, NULL );
+	PARALLEL_EXECUTE( NTHREADS, ComputeForces, NULL );
   
-  PARALLEL_EXECUTE( NTHREADS, ComputeAvgVel, NULL );
+	PARALLEL_EXECUTE( NTHREADS, Update, NULL );
 
-  PrintResults (INPARAMS tstep, (double)ekin, (double)epot, (double)vir,(double)vel,(double)count,numMoles,(int)ninter);
+	PrintResults (INPARAMS tstep, (double)ekin, (double)epot, (double)vir,(double)vel,(double)count,numMoles,(int)ninter);
   } 
   return;
 }
+#endif
 
 
 /*
@@ -995,6 +1164,8 @@ void do_libtm_work(void) {
 
 int main( int argc, char *argv[])
 {
+
+#ifdef TM
   if (argc < 4)
   {
     printf("Usage: ./moldyn NTHREADS MAX_RETRIES TXN_SIZE\n");
@@ -1003,6 +1174,14 @@ int main( int argc, char *argv[])
   NTHREADS = atoi(argv[1]);
   MAX_RETRIES = atoi(argv[2]);
   TXN_SIZE = atoi(argv[3]);
+#else
+  if (argc < 2)
+  {
+    printf("Usage: ./moldyn NTHREADS\n");
+    return 1;
+  }
+  NTHREADS = atoi(argv[1]);
+#endif
 
   intptr_t i; 
   int j;
@@ -1011,26 +1190,51 @@ int main( int argc, char *argv[])
   InitCoordinates(INPARAMS numMoles, BOXSIZE, perturb);
   InitVelocities (INPARAMS timeStep);
   InitForces     ();
+  /* funciton to compensate for moving updatecoordinates to the end */
+  FirstCoordinates();
 
+#ifdef PTHREAD
+  /* barrier only needed in the non predicated-commit pthread version */
+  barrier_init(&barrier, NTHREADS); 
+#endif
+
+#if defined(PTHREAD) 
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setscope(&attr, PTHREAD_SCOPE_SYSTEM);
+  pthread_t* threads = new pthread_t[ NTHREADS-1 ];
+#endif
+
+  vir  = 0.0;
+  epot = 0.0;
+  ekin = 0.0;
+  vel = 0.0;
+  count = 0.0;
+
+#if defined(PTHREAD)
+  for( i = 1; i < NTHREADS; i++ )
+    pthread_create( &threads[i-1], &attr, do_thread_work, (void*)i );
+
+  do_thread_work ((void *)0);
+
+  for( i = 1; i < NTHREADS; i++ )
+    pthread_join( threads[i-1], NULL );
+#else
   CREATE_TM_THREADS( NTHREADS );
 
   do_libtm_work();
 
   DESTROY_TM_THREADS( NTHREADS );
+#endif
+  
 
   printf("\n");
 
-#ifdef OOP
   delete [] molecules;
-#else
-  delete [] x;
-  delete [] f;
-#endif
-
   delete [] vh;
 
-#ifdef FINE
-  delete [] mutex_list_tm;
+#if defined(PTHREAD) && defined(FINE)
+  delete [] mutex_list_pthread;
 #endif
 
 #ifndef OLD_DS
@@ -1041,8 +1245,6 @@ int main( int argc, char *argv[])
   }
 #endif
   delete [] inter;
-
+  printf("total aborts: %d\n", num_aborts);
   return 0;
 }
-
-

@@ -11,7 +11,7 @@ ifeq ($(DEBUG), )
 endif
 
 #Application options
-VERSION = -DSUPER -DTM -DOOP
+VERSION = -DSMALL -DPTHREAD -DOOP
 #    VERSION = -DVERSION_DYNAMIC
 #    export VERSION
 
@@ -26,7 +26,7 @@ CXXFLAGS := $(DEBUG) $(VERSION) -mrtm
 LDFLAGS = -lm -lpthread -l_tm -lrt 
 
 LIBTM_DIR = ../..
-OUT_DIR = ../..
+OUT_DIR = .
 
 .c.o:
 	$(CXX) $(CXXFLAGS) -c $*.cc 
